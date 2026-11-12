@@ -48,6 +48,8 @@ export function detectPage(img, { inset = 0.003 } = {}) {
     if (!best || comp.length > best.comp.length) best = { comp, touches: touchL + touchR + touchT + touchB };
   }
   if (!best) return null;
+  const grown = growSmooth(best.comp, g, w, h, t);
+  if (grown) best = grown;
   const frac = best.comp.length / (w * h);
   // page fills the frame (or nothing page-like found): use the whole photo
   if (frac < 0.08 || best.touches >= 3) return null;
@@ -73,6 +75,59 @@ export function detectPage(img, { inset = 0.003 } = {}) {
     const ccx = (cx + 0.5) / s, ccy = (cy + 0.5) / s;
     return [fx + (ccx - fx) * inset * 2, fy + (ccy - fy) * inset * 2];
   });
+}
+
+// Part of a page in shadow can be darker than the global brightness threshold. Paper is
+// smooth even in shadow while most backgrounds (carpet, wood grain, fabric) are textured,
+// so grow from the bright part into connected pixels that are fairly bright AND smooth.
+// Returns null (keep the bright region) if growing escapes into the background.
+function growSmooth(seed, g, w, h, t) {
+  // local standard deviation in a 5x5 window via integral images
+  const S = new Float64Array((w + 1) * (h + 1)), S2 = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let r = 0, r2 = 0;
+    for (let x = 0; x < w; x++) {
+      const v = g[y * w + x];
+      r += v; r2 += v * v;
+      const k = (y + 1) * (w + 1) + x + 1;
+      S[k] = S[k - w - 1] + r; S2[k] = S2[k - w - 1] + r2;
+    }
+  }
+  const sd = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const x0 = Math.max(0, x - 2), x1 = Math.min(w, x + 3), y0 = Math.max(0, y - 2), y1 = Math.min(h, y + 3);
+    const n = (x1 - x0) * (y1 - y0);
+    const a = y1 * (w + 1) + x1, b = y0 * (w + 1) + x1, c = y1 * (w + 1) + x0, d = y0 * (w + 1) + x0;
+    const m = (S[a] - S[b] - S[c] + S[d]) / n;
+    sd[y * w + x] = Math.sqrt(Math.max(0, (S2[a] - S2[b] - S2[c] + S2[d]) / n - m * m));
+  }
+  let paper = 0, bg = 0, nb = 0;
+  for (const p of seed) paper += g[p];
+  paper /= seed.length;
+  for (let k = 0; k < g.length; k++) if (g[k] <= t) { bg += g[k]; nb++; }
+  bg = nb ? bg / nb : 0;
+  const tLow = bg + 0.35 * (paper - bg);
+  const seedSd = [];
+  for (let i = 0; i < seed.length; i += 7) seedSd.push(sd[seed[i]]);
+  seedSd.sort((a, b) => a - b);
+  const sdMax = Math.max(6, 2.5 * seedSd[seedSd.length >> 1] + 3);
+  const inR = new Uint8Array(w * h);
+  const comp = [...seed];
+  for (const p of seed) inR[p] = 1;
+  for (let i = 0; i < comp.length; i++) {
+    const p = comp[i], x = p % w, y = (p - x) / w;
+    for (const q of [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, y > 0 ? p - w : -1, y < h - 1 ? p + w : -1]) {
+      if (q >= 0 && !inR[q] && g[q] > tLow && sd[q] < sdMax) { inR[q] = 1; comp.push(q); }
+    }
+  }
+  if (comp.length === seed.length) return null;
+  let tl = 0, tr = 0, tt = 0, tb = 0;
+  for (const p of comp) {
+    const x = p % w, y = (p - x) / w;
+    if (x === 0) tl = 1; if (x === w - 1) tr = 1; if (y === 0) tt = 1; if (y === h - 1) tb = 1;
+  }
+  if (tl + tr + tt + tb >= 3 || comp.length > 0.97 * w * h) return null; // leaked into the background
+  return { comp, touches: tl + tr + tt + tb };
 }
 
 // Outer boundary samples of the sheet: for each row its leftmost/rightmost pixel, for each
