@@ -20,7 +20,10 @@ export function extractStrokes(img, opts = {}) {
   const { width: w, height: h } = img;
   const gray = toGray(img);
   const dark = darkness(gray, w, h);
-  const blobs = o.removeBlobs ? maskBlobs(dark, w, h, typicalStrokeHalf(hysteresis(dark, w, h, o.sensitivity), w, h)) : null;
+  const blobHalf = o.removeBlobs ? typicalStrokeHalf(hysteresis(dark, w, h, o.sensitivity), w, h) : 0;
+  const blobs = o.removeBlobs ? maskBlobs(dark, w, h, blobHalf) : null;
+  if (o.stats) o.stats.blobHalf = +blobHalf.toFixed(2);
+  if (o.blobsOut) o.blobsOut(blobs);
   let lineBands = [];
   if (o.removeLines) {
     lineBands = removeRuledLines(dark, w, h);
@@ -28,7 +31,11 @@ export function extractStrokes(img, opts = {}) {
   }
   if (o.darkOut) o.darkOut(dark);
   const ink = hysteresis(dark, w, h, o.sensitivity);
-  if (o.dropFaint) dropFaintMarks(ink, dark, w, h);
+  if (lineBands.length) clearLineRuns(ink, dark, lineBands, w, h, Math.round(2 * (blobHalf || 2.5) + 2));
+  // printed-text filter: full strength up to the middle setting, off near the top
+  const faintRatio = 0.4 * Math.min(1, Math.max(0, (0.85 - o.sensitivity) / 0.35));
+  if (o.dropFaint && faintRatio > 0) dropFaintMarks(ink, dark, w, h, faintRatio);
+  if (o.inkOut) o.inkOut(ink, dark);
   removeSpecks(ink, w, h, o.minComponentArea || Math.max(8, Math.round((w * h) / 2e5)));
   const dist = distanceTransform(ink, w, h);
   const skel = thin(ink, w, h);
@@ -189,10 +196,33 @@ function removeRuledLines(d, w, h) {
   return removed;
 }
 
+// Within each ruled-line band, keep faint ink only in columns where it continues above or
+// below the band (a letter crossing or sitting on the line). Faint runs that exist only
+// inside the band are what is left of the printed line between letters.
+function clearLineRuns(ink, d, bands, w, h, k) {
+  // Real ink is far darker than what is left of a printed line after subtraction, so only
+  // faint runs are cleared; a pen line drawn right along a ruled line survives.
+  const sample = [];
+  for (let i = 0; i < ink.length; i += 3) if (ink[i]) sample.push(d[i]);
+  const faint = 0.5 * (median(sample) || 0.2);
+  for (const [b0, b1] of bands) {
+    const ya = Math.max(0, b0 - 1), yb = Math.min(h - 1, b1 + 1);
+    for (let x = 0; x < w; x++) {
+      let inBand = false, peak = 0;
+      for (let y = ya; y <= yb; y++) if (ink[y * w + x]) { inBand = true; peak = Math.max(peak, d[y * w + x]); }
+      if (!inBand || peak >= faint) continue;
+      let outside = false;
+      for (let y = Math.max(0, ya - k); y < ya && !outside; y++) outside = ink[y * w + x] === 1;
+      for (let y = yb + 1; y <= Math.min(h - 1, yb + k) && !outside; y++) outside = ink[y * w + x] === 1;
+      if (!outside) for (let y = ya; y <= yb; y++) ink[y * w + x] = 0;
+    }
+  }
+}
+
 // Small marks much fainter than the rest of the writing are the paper's own printing
 // (page numbers, "Date", brand footers). Faintness is judged against this page's own
 // median ink, so a page written entirely in light pencil keeps its pencil.
-function dropFaintMarks(ink, d, w, h) {
+function dropFaintMarks(ink, d, w, h, ratio) {
   const label = new Int32Array(w * h).fill(-1);
   const comps = [];
   const stack = [];
@@ -211,13 +241,11 @@ function dropFaintMarks(ink, d, w, h) {
     comps.push({ px, mean: sum / px.length, size: Math.max(x1 - x0, y1 - y0) });
   }
   if (comps.length < 3) return;
-  // area-weighted median darkness of the page's ink
-  const byDark = [...comps].sort((a, b) => a.mean - b.mean);
-  const total = comps.reduce((t, c) => t + c.px.length, 0);
-  let acc = 0, med = byDark[byDark.length - 1].mean;
-  for (const c of byDark) { acc += c.px.length; if (acc >= total / 2) { med = c.mean; break; } }
+  // reference: the median darkness of the page's marks (each letter or line counts once,
+  // so a few bold drawing lines don't make lighter handwriting look "faint")
+  const med = median(comps.map((c) => c.mean));
   const small = 0.04 * Math.max(w, h);
-  for (const c of comps) if (c.mean < 0.45 * med && c.size < small) for (const p of c.px) ink[p] = 0;
+  for (const c of comps) if (c.mean < ratio * med && c.size < small) for (const p of c.px) ink[p] = 0;
 }
 
 // Typical stroke half-width in px: the median distance-transform value on stroke ridges
