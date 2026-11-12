@@ -6,9 +6,9 @@
 // Paper is the largest bright region. Its corners come from the extreme points of x+y and
 // x-y, which is reliable for pages turned up to about 30 degrees and shot at an angle.
 
-export function detectPage(img, { inset = 0.012 } = {}) {
+export function detectPage(img, { inset = 0.003 } = {}) {
   const { width: W, height: H, data } = img;
-  const s = Math.min(1, 480 / Math.max(W, H));
+  const s = Math.min(1, 900 / Math.max(W, H));
   const w = Math.max(1, Math.round(W * s)), h = Math.max(1, Math.round(H * s));
   // downscale (box average) to grey
   const g = new Float32Array(w * h);
@@ -63,12 +63,70 @@ export function detectPage(img, { inset = 0.012 } = {}) {
     if (x - y < mn2) { mn2 = x - y; bl = [x, y]; }
   }
   cx /= best.comp.length; cy /= best.comp.length;
+  // Refine: fit a straight line to each edge of the sheet and intersect them. This finds
+  // the true corners even when the paper has rounded corners.
+  const fitted = fitEdges(best.comp, w, h, [tl, tr, br, bl]);
+  if (fitted) [tl, tr, br, bl] = fitted;
   // back to full resolution (pixel centres), pulled slightly inward to skip the paper edge
   return [tl, tr, br, bl].map(([x, y]) => {
     const fx = (x + 0.5) / s, fy = (y + 0.5) / s;
     const ccx = (cx + 0.5) / s, ccy = (cy + 0.5) / s;
     return [fx + (ccx - fx) * inset * 2, fy + (ccy - fy) * inset * 2];
   });
+}
+
+// Outer boundary samples of the sheet: for each row its leftmost/rightmost pixel, for each
+// column its topmost/bottommost. Each edge is fitted (trimming outliers such as binder
+// holes or a thumb) away from the corners, then neighbouring edges are intersected.
+function fitEdges(comp, w, h, [tl, tr, br, bl]) {
+  const minX = new Int32Array(h).fill(w), maxX = new Int32Array(h).fill(-1);
+  const minY = new Int32Array(w).fill(h), maxY = new Int32Array(w).fill(-1);
+  for (const p of comp) {
+    const x = p % w, y = (p - x) / w;
+    if (x < minX[y]) minX[y] = x;
+    if (x > maxX[y]) maxX[y] = x;
+    if (y < minY[x]) minY[x] = y;
+    if (y > maxY[x]) maxY[x] = y;
+  }
+  const span = (a, b) => { const lo = Math.min(a, b), hi = Math.max(a, b), m = (hi - lo) * 0.12; return [Math.ceil(lo + m), Math.floor(hi - m)]; };
+  // fit u = a*v + b over samples [v, u]; two passes, dropping points far from the first fit
+  const fit = (pts) => {
+    if (pts.length < 8) return null;
+    let use = pts;
+    for (let pass = 0; pass < 3; pass++) {
+      let sv = 0, su = 0, svv = 0, svu = 0;
+      for (const [v, u] of use) { sv += v; su += u; svv += v * v; svu += v * u; }
+      const n = use.length, den = n * svv - sv * sv;
+      if (!den) return null;
+      const a = (n * svu - sv * su) / den, b = (su - a * sv) / n;
+      const res = pts.map(([v, u]) => Math.abs(u - (a * v + b)));
+      const sorted = [...res].sort((x, y) => x - y);
+      const tol = Math.max(1.5, 2.5 * sorted[sorted.length >> 1]);
+      const next = pts.filter((_, i) => res[i] <= tol);
+      if (pass === 2 || next.length < 8) return { a, b };
+      use = next;
+    }
+  };
+  const rows = (y0, y1, arr) => { const out = []; for (let y = y0; y <= y1; y++) if (arr[y] >= 0 && arr[y] < w) out.push([y, arr[y]]); return out; };
+  const cols = (x0, x1, arr) => { const out = []; for (let x = x0; x <= x1; x++) if (arr[x] >= 0 && arr[x] < h) out.push([x, arr[x]]); return out; };
+  const left = fit(rows(...span(tl[1], bl[1]), minX));   // x = a*y + b
+  const right = fit(rows(...span(tr[1], br[1]), maxX));
+  const top = fit(cols(...span(tl[0], tr[0]), minY));    // y = a*x + b
+  const bottom = fit(cols(...span(bl[0], br[0]), maxY));
+  if (!left || !right || !top || !bottom) return null;
+  const meet = (vert, horiz) => { // x = va*y + vb, y = ha*x + hb
+    const den = 1 - vert.a * horiz.a;
+    if (Math.abs(den) < 1e-6) return null;
+    const x = (vert.a * horiz.b + vert.b) / den;
+    return [x, horiz.a * x + horiz.b];
+  };
+  const out = [meet(left, top), meet(right, top), meet(right, bottom), meet(left, bottom)];
+  if (out.some((p) => !p)) return null;
+  // sanity: the refined corners must stay near the rough ones
+  const tolPx = 0.06 * Math.max(w, h);
+  const rough = [tl, tr, br, bl];
+  if (out.some((p, i) => Math.hypot(p[0] - rough[i][0], p[1] - rough[i][1]) > tolPx)) return null;
+  return out;
 }
 
 function otsu(g) {

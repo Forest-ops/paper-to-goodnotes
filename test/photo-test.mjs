@@ -12,7 +12,7 @@ const k = process.argv[3] ? +process.argv[3] : undefined;
 const img = jpeg.decode(fs.readFileSync(file), { useTArray: true });
 let t = performance.now();
 const quad = detectPage(img);
-const page = quad ? warpPage(img, quad) : img;
+const page = quad ? warpPage(img, quad, { maxWidth: 1800 }) : img;
 const tPage = performance.now() - t;
 t = performance.now();
 const stats = {};
@@ -36,4 +36,4 @@ const colors = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#0aa", "
 const paths = strokes.map((s, i) =>
   `<polyline points="${s.points.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ")}" fill="none" stroke="${colors[i % colors.length]}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`).join("");
 fs.writeFileSync("out/photo-overlay.svg",
-  `<svg xmlns="http://www.w3.org/2000/svg" width="${page.width}" height="${page.height}"><image href="photo-page.png" width="${page.width}" height="${page.height}" opacity="0.45"/>${paths}</svg>`);
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${page.width} ${page.height}" width="${Math.round(page.width * 1200 / page.height)}" height="1200"><image href="photo-page.png" width="${page.width}" height="${page.height}" opacity="0.45"/>${paths}</svg>`);

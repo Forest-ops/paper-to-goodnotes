@@ -8,6 +8,7 @@ const DEFAULTS = {
   sensitivity: 0.5,   // 0..1; higher finds fainter ink (and more smudges)
   removeLines: true,  // subtract printed ruled lines
   removeBlobs: true,  // ignore large solid dark areas (binder holes, shadows, fills)
+  dropFaint: true,    // ignore small marks far fainter than the page's writing (printed text)
   minComponentArea: 0, // drop specks smaller than this (0 = auto)
   spurFactor: 1.5,    // prune skeleton branches shorter than this x stroke width
   joinAngleDeg: 40,   // continue straight through a junction if the bend is under this
@@ -27,6 +28,7 @@ export function extractStrokes(img, opts = {}) {
   }
   if (o.darkOut) o.darkOut(dark);
   const ink = hysteresis(dark, w, h, o.sensitivity);
+  if (o.dropFaint) dropFaintMarks(ink, dark, w, h);
   removeSpecks(ink, w, h, o.minComponentArea || Math.max(8, Math.round((w * h) / 2e5)));
   const dist = distanceTransform(ink, w, h);
   const skel = thin(ink, w, h);
@@ -81,7 +83,9 @@ export function darkness(gray, w, h) {
       grid[by * bw + bx] = buf[Math.floor(buf.length * 0.9)];
     }
   }
-  // 3x3 max (blocks covered by ink borrow paper from neighbours), then 3x3 mean
+  // Blocks covered by ink borrow the paper level of their brightest neighbour, but only
+  // a little brighter than their own, so a shadow's edge is not over-corrected into "ink".
+  // Then smooth with a 3x3 mean.
   const pass = (src, fn) => {
     const out = new Float32Array(src.length);
     for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
@@ -94,7 +98,11 @@ export function darkness(gray, w, h) {
     }
     return out;
   };
-  grid = pass(grid, (v) => Math.max(...v));
+  {
+    const own = grid;
+    const mx = pass(grid, (v) => Math.max(...v));
+    grid = mx.map((m, k) => Math.min(m, own[k] + 0.04));
+  }
   grid = pass(grid, (v) => v.reduce((a, b) => a + b, 0) / v.length);
   const d = new Float32Array(w * h);
   for (let y = 0; y < h; y++) {
@@ -109,9 +117,13 @@ export function darkness(gray, w, h) {
     }
   }
   // the outermost sliver is usually the paper's edge or what is beyond it
-  const m = Math.max(2, Math.round(Math.min(w, h) * 0.006));
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++)
-    if (x < m || y < m || x >= w - m || y >= h - m) d[y * w + x] = 0;
+  // and rounded paper corners leave a wedge of background in each corner
+  const m = Math.max(2, Math.round(Math.min(w, h) * 0.004));
+  const c = Math.round(Math.min(w, h) * 0.022);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const nearX = x < c || x >= w - c, nearY = y < c || y >= h - c;
+    if (x < m || y < m || x >= w - m || y >= h - m || (nearX && nearY)) d[y * w + x] = 0;
+  }
   return d;
 }
 
@@ -175,6 +187,37 @@ function removeRuledLines(d, w, h) {
     }
   }
   return removed;
+}
+
+// Small marks much fainter than the rest of the writing are the paper's own printing
+// (page numbers, "Date", brand footers). Faintness is judged against this page's own
+// median ink, so a page written entirely in light pencil keeps its pencil.
+function dropFaintMarks(ink, d, w, h) {
+  const label = new Int32Array(w * h).fill(-1);
+  const comps = [];
+  const stack = [];
+  for (let s = 0; s < ink.length; s++) {
+    if (!ink[s] || label[s] >= 0) continue;
+    const id = comps.length, px = [];
+    let sum = 0, x0 = w, x1 = 0, y0 = h, y1 = 0;
+    label[s] = id; stack.push(s);
+    while (stack.length) {
+      const p = stack.pop();
+      px.push(p); sum += d[p];
+      const x = p % w, y = (p - x) / w;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      forNeighbors(p, w, h, (q) => { if (ink[q] && label[q] < 0) { label[q] = id; stack.push(q); } });
+    }
+    comps.push({ px, mean: sum / px.length, size: Math.max(x1 - x0, y1 - y0) });
+  }
+  if (comps.length < 3) return;
+  // area-weighted median darkness of the page's ink
+  const byDark = [...comps].sort((a, b) => a.mean - b.mean);
+  const total = comps.reduce((t, c) => t + c.px.length, 0);
+  let acc = 0, med = byDark[byDark.length - 1].mean;
+  for (const c of byDark) { acc += c.px.length; if (acc >= total / 2) { med = c.mean; break; } }
+  const small = 0.04 * Math.max(w, h);
+  for (const c of comps) if (c.mean < 0.45 * med && c.size < small) for (const p of c.px) ink[p] = 0;
 }
 
 // Typical stroke half-width in px: the median distance-transform value on stroke ridges
