@@ -8,7 +8,8 @@ file with real, editable ink strokes.
 | Path | What it is |
 |---|---|
 | `app/` | The web app: `index.html`, `app.js`, `worker.js`, manifest, service worker, icons, `template.json` |
-| `src/extract.js` | Photo → strokes (adaptive threshold, thinning, stroke tracing) |
+| `src/page.js` | Find the sheet of paper in a photo and straighten it (perspective correction) |
+| `src/extract.js` | Page → strokes: even out lighting, subtract ruled lines, mask binder holes, two-level ink threshold, thinning, stroke tracing |
 | `src/goodnotes.js` | Strokes → `.goodnotes` (protobuf, point data, outline, zip) with a safety validator |
 | `src/layout.js` | Photo pixels → Goodnotes page points |
 | `tools/` | Python tools for reverse-engineering and checking files (`gndump`, `gnstrokes`, `gnwrite`, `maketemplate`) |
