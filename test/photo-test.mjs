@@ -2,6 +2,7 @@
 //   node test/photo-test.mjs samples/real/catapult.jpg [sensitivity 0..1]
 // Writes out/photo-page.png (straightened page) and out/photo-overlay.svg (+ .png via Edge).
 import fs from "node:fs";
+const STAMP = Date.now(); // unique image names: the screenshot browser caches by URL
 import jpeg from "jpeg-js";
 import { PNG } from "pngjs";
 import { detectPage, warpPage } from "../src/page.js";
@@ -27,7 +28,7 @@ console.log(`strokes: ${strokes.length} in ${tEx.toFixed(0)} ms`, JSON.stringify
 fs.mkdirSync("out", { recursive: true });
 const png = new PNG({ width: page.width, height: page.height });
 png.data = Buffer.from(page.data.buffer, page.data.byteOffset, page.data.length);
-fs.writeFileSync("out/photo-page.png", PNG.sync.write(png));
+fs.writeFileSync(`out/photo-page-${STAMP}.png`, PNG.sync.write(png));
 // darkness map after line/blob removal, contrast x5, for tuning
 const dm = new PNG({ width: page.width, height: page.height });
 for (let i = 0; i < dark.length; i++) { const v = 255 - Math.min(255, dark[i] * 5 * 255); dm.data[i * 4] = dm.data[i * 4 + 1] = dm.data[i * 4 + 2] = v; dm.data[i * 4 + 3] = 255; }
@@ -36,4 +37,4 @@ const colors = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#0aa", "
 const paths = strokes.map((s, i) =>
   `<polyline points="${s.points.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ")}" fill="none" stroke="${colors[i % colors.length]}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`).join("");
 fs.writeFileSync("out/photo-overlay.svg",
-  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${page.width} ${page.height}" width="${Math.round(page.width * 1200 / page.height)}" height="1200"><image href="photo-page.png" width="${page.width}" height="${page.height}" opacity="0.45"/>${paths}</svg>`);
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${page.width} ${page.height}" width="${Math.round(page.width * 1200 / page.height)}" height="1200"><image href="photo-page-${STAMP}.png" width="${page.width}" height="${page.height}" opacity="0.45"/>${paths}</svg>`);

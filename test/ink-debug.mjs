@@ -10,7 +10,7 @@ const page = warpPage(img, detectPage(img), { maxWidth: 1800 });
 const { width: W, height: H } = page;
 const x0 = Math.round(fx0 * W), y0 = Math.round(fy0 * H), w = Math.round((fx1 - fx0) * W), h = Math.round((fy1 - fy0) * H);
 let ink, dark;
-const strokes = extractStrokes(page, { inkOut: (i, d) => { ink = Uint8Array.from(i); dark = Float32Array.from(d); } });
+const strokes = extractStrokes(page, { ...JSON.parse(process.env.OPTS || "{}"), inkOut: (i, d) => { ink = Uint8Array.from(i); dark = Float32Array.from(d); } });
 const out = new PNG({ width: w * 3, height: h });
 for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
   const p = (y0 + y) * W + x0 + x;

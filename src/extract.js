@@ -6,7 +6,9 @@
 
 const DEFAULTS = {
   sensitivity: 0.5,   // 0..1; higher finds fainter ink (and more smudges)
-  removeLines: true,  // subtract printed ruled lines
+  removeLines: true,  // remove printed ruled lines from the ink
+  subtractLines: false, // also subtract their darkness first (older method, weakens letters on lines)
+  lineSupport: 2,     // a ruled-line pixel is kept only if ink continues this many px above/below
   removeBlobs: true,  // ignore large solid dark areas (binder holes, shadows, fills)
   dropFaint: true,    // ignore small marks far fainter than the page's writing (printed text)
   minComponentArea: 0, // drop specks smaller than this (0 = auto)
@@ -22,16 +24,17 @@ export function extractStrokes(img, opts = {}) {
   const dark = darkness(gray, w, h);
   const blobHalf = o.removeBlobs ? typicalStrokeHalf(hysteresis(dark, w, h, o.sensitivity), w, h) : 0;
   const blobs = o.removeBlobs ? maskBlobs(dark, w, h, blobHalf) : null;
+  const thr = inkThresholds(dark, w, h, o.sensitivity);
   if (o.stats) o.stats.blobHalf = +blobHalf.toFixed(2);
   if (o.blobsOut) o.blobsOut(blobs);
   let lineBands = [];
   if (o.removeLines) {
-    lineBands = removeRuledLines(dark, w, h);
+    lineBands = removeRuledLines(dark, w, h, o.subtractLines);
     if (o.stats) o.stats.ruledLines = lineBands.length;
   }
   if (o.darkOut) o.darkOut(dark);
-  const ink = hysteresis(dark, w, h, o.sensitivity);
-  if (lineBands.length) clearLineRuns(ink, dark, lineBands, w, h, Math.round(2 * (blobHalf || 2.5) + 2));
+  const ink = hysteresis(dark, w, h, o.sensitivity, thr);
+  if (lineBands.length && o.clearRuns !== false) clearLineRuns(ink, dark, lineBands, w, h, o.lineSupport);
   // printed-text filter: full strength up to the middle setting, off near the top
   const faintRatio = 0.4 * Math.min(1, Math.max(0, (0.85 - o.sensitivity) / 0.35));
   if (o.dropFaint && faintRatio > 0) dropFaintMarks(ink, dark, w, h, faintRatio);
@@ -51,11 +54,12 @@ export function extractStrokes(img, opts = {}) {
     pts = clampWidths(pts);
     pts = smooth(pts, 2);
     pts = simplify(pts, o.simplifyEps);
-    if (length(pts) < Math.max(3, 2 * typicalHalf)) continue; // speck
-    if (onRuledLine(pts, lineBands, typicalHalf)) continue;  // leftover piece of a printed line
+    const drop = (why) => { if (o.dropped) o.dropped(why, pts); };
+    if (length(pts) < Math.max(3, 2 * typicalHalf)) { drop("speck"); continue; }
+    if (onRuledLine(pts, lineBands, typicalHalf)) { drop("ruled line"); continue; }
     if (blobs && length(pts) < 8 * typicalHalf) {            // crumb at the rim of a hole
       const lim = (blobs.reach + 6 * typicalHalf) ** 2;
-      if (pts.some(([x, y]) => blobs.toCore[Math.min(h - 1, y | 0) * w + Math.min(w - 1, x | 0)] <= lim)) continue;
+      if (pts.some(([x, y]) => blobs.toCore[Math.min(h - 1, y | 0) * w + Math.min(w - 1, x | 0)] <= lim)) { drop("hole crumb"); continue; }
     }
     strokes.push({ points: pts });
   }
@@ -138,7 +142,7 @@ export function darkness(gray, w, h) {
 // For those rows, subtract the line's own darkness (a horizontal opening, which ignores
 // pen strokes crossing it), capped near the line's typical level so that ink drawn right
 // on top of a line survives. Returns the row bands of the lines removed.
-function removeRuledLines(d, w, h) {
+function removeRuledLines(d, w, h, subtract = true) {
   const x0 = Math.floor(w * 0.08), x1 = Math.ceil(w * 0.92);
   const prof = new Float32Array(h);
   for (let y = 0; y < h; y++) {
@@ -186,6 +190,7 @@ function removeRuledLines(d, w, h) {
     for (let x = x0; x < x1; x++) if (tmp[x] - ref[x] >= 0.5 * peak[pk] && tmp[x] <= 0.3) covered++;
     if (covered < 0.55 * (x1 - x0)) continue;
     removed.push([b0, b1]);
+    if (!subtract) continue;
     for (let y = Math.max(0, b0 - 1); y <= Math.min(h - 1, b1 + 1); y++) {
       const row = d.subarray(y * w, y * w + w);
       openRow(row, op, r, tmp);
@@ -200,20 +205,29 @@ function removeRuledLines(d, w, h) {
 // below the band (a letter crossing or sitting on the line). Faint runs that exist only
 // inside the band are what is left of the printed line between letters.
 function clearLineRuns(ink, d, bands, w, h, k) {
-  // Real ink is far darker than what is left of a printed line after subtraction, so only
-  // faint runs are cleared; a pen line drawn right along a ruled line survives.
-  const sample = [];
-  for (let i = 0; i < ink.length; i += 3) if (ink[i]) sample.push(d[i]);
-  const faint = 0.5 * (median(sample) || 0.2);
+  // Only ink about as light as the printed line itself is cleared; a pen or pencil line
+  // drawn right along a ruled line is darker than the line and survives.
   for (const [b0, b1] of bands) {
     const ya = Math.max(0, b0 - 1), yb = Math.min(h - 1, b1 + 1);
+    // this line's own darkness: across most columns the band holds nothing but the line
+    const colMax = [];
+    for (let x = 0; x < w; x += 2) {
+      let m = 0;
+      for (let y = ya; y <= yb; y++) m = Math.max(m, d[y * w + x]);
+      colMax.push(m);
+    }
+    const faint = 2.2 * median(colMax) + 0.02;
     for (let x = 0; x < w; x++) {
       let inBand = false, peak = 0;
       for (let y = ya; y <= yb; y++) if (ink[y * w + x]) { inBand = true; peak = Math.max(peak, d[y * w + x]); }
       if (!inBand || peak >= faint) continue;
-      let outside = false;
-      for (let y = Math.max(0, ya - k); y < ya && !outside; y++) outside = ink[y * w + x] === 1;
-      for (let y = yb + 1; y <= Math.min(h - 1, yb + k) && !outside; y++) outside = ink[y * w + x] === 1;
+      // ink must continue directly out of the band: every row of the k just above (or
+      // just below) the band is ink in this column or a neighbouring one
+      const col = (y) => ink[y * w + x] || (x > 0 && ink[y * w + x - 1]) || (x < w - 1 && ink[y * w + x + 1]);
+      let up = ya - k >= 0, down = yb + k < h;
+      for (let y = ya - k; y < ya && up; y++) up = !!col(y);
+      for (let y = yb + 1; y <= yb + k && down; y++) down = !!col(y);
+      const outside = up || down;
       if (!outside) for (let y = ya; y <= yb; y++) ink[y * w + x] = 0;
     }
   }
@@ -245,7 +259,20 @@ function dropFaintMarks(ink, d, w, h, ratio) {
   // so a few bold drawing lines don't make lighter handwriting look "faint")
   const med = median(comps.map((c) => c.mean));
   const small = 0.04 * Math.max(w, h);
-  for (const c of comps) if (c.mean < ratio * med && c.size < small) for (const p of c.px) ink[p] = 0;
+  const faint = comps.filter((c) => c.mean < ratio * med && c.size < small);
+  if (!faint.length) return;
+  // a light mark close to clear writing is part of it (a lighter letter in a word);
+  // the paper's printing sits on its own
+  const notWriting = new Uint8Array(w * h); // 0 = clear ink, 1 = everything else
+  for (let i = 0; i < ink.length; i++) notWriting[i] = ink[i] ? 0 : 1;
+  for (const c of faint) for (const p of c.px) notWriting[p] = 1;
+  const dist = distanceTransform(notWriting, w, h); // squared distance to the nearest clear ink
+  const reach = (0.02 * Math.max(w, h)) ** 2;
+  for (const c of faint) {
+    let closest = Infinity;
+    for (let i = 0; i < c.px.length; i += 3) closest = Math.min(closest, dist[c.px[i]]);
+    if (closest > reach) for (const p of c.px) ink[p] = 0;
+  }
 }
 
 // Typical stroke half-width in px: the median distance-transform value on stroke ridges
@@ -302,7 +329,7 @@ function maskBlobs(d, w, h, half) {
 
 // Two-level threshold: strong ink starts a stroke, fainter ink connected to it extends it.
 // Faint pencil survives as long as part of it is clearly visible; isolated grain does not.
-function hysteresis(raw, w, h, sensitivity) {
+function blur3(raw, w, h) {
   // 3x3 box blur: grain averages out, real strokes (2+ px wide) keep most of their darkness
   const d = new Float32Array(w * h);
   for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
@@ -310,7 +337,14 @@ function hysteresis(raw, w, h, sensitivity) {
     for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) t += raw[(y + dy) * w + x + dx];
     d[y * w + x] = t / 9;
   }
-  // noise floor of this photo: median and spread of the (mostly paper) darkness values
+  return d;
+}
+
+// Ink thresholds from this photo's noise floor: the median and spread of the (mostly
+// paper) darkness values. Measure this before ruled lines are subtracted: a page with its
+// lines removed looks cleaner than it is, and lower thresholds let line remnants through.
+function inkThresholds(raw, w, h, sensitivity) {
+  const d = blur3(raw, w, h);
   const sample = [];
   for (let i = 0; i < d.length; i += 7) sample.push(d[i]);
   sample.sort((a, b) => a - b);
@@ -319,6 +353,12 @@ function hysteresis(raw, w, h, sensitivity) {
   const s = Math.min(1, Math.max(0, sensitivity));
   const lo = Math.max(0.07 - 0.05 * s, med + (6 - 3 * s) * mad); // base 0.07 .. 0.02
   const hi = Math.max(lo * 2, med + (10 - 4 * s) * mad);
+  return { lo, hi };
+}
+
+function hysteresis(raw, w, h, sensitivity, thr = inkThresholds(raw, w, h, sensitivity)) {
+  const d = blur3(raw, w, h);
+  const { lo, hi } = thr;
   const ink = new Uint8Array(w * h);
   const stack = [];
   for (let i = 0; i < d.length; i++) {
@@ -682,10 +722,14 @@ function simplify(pts, eps) {
   while (stack.length) {
     const [i, j] = stack.pop();
     const [ax, ay] = pts[i], [bx, by] = pts[j];
-    const L = Math.hypot(bx - ax, by - ay) || 1e-9;
+    const L = Math.hypot(bx - ax, by - ay);
     let best = -1, bi = -1;
     for (let k = i + 1; k < j; k++) {
-      const d = Math.abs((bx - ax) * (ay - pts[k][1]) - (ax - pts[k][0]) * (by - ay)) / L;
+      // closed loops (an "o", an "a") start and end on the same pixel: measure distance
+      // from that point instead of from a zero-length line, or the loop collapses
+      const d = L < 1e-6
+        ? Math.hypot(pts[k][0] - ax, pts[k][1] - ay)
+        : Math.abs((bx - ax) * (ay - pts[k][1]) - (ax - pts[k][0]) * (by - ay)) / L;
       if (d > best) { best = d; bi = k; }
     }
     if (best > eps) { keep[bi] = 1; stack.push([i, bi], [bi, j]); }
