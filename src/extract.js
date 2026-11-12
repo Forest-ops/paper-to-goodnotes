@@ -5,9 +5,9 @@
 //   // -> [{ points: [[x, y, halfWidth], ...] }, ...] in pixel units
 
 const DEFAULTS = {
-  window: 0,          // adaptive-threshold window in px (0 = auto from image size)
-  sauvolaK: 0.2,      // threshold sensitivity; higher = less ink
-  minInkContrast: 0.08, // ink must be this much darker than its surroundings
+  sensitivity: 0.5,   // 0..1; higher finds fainter ink (and more smudges)
+  removeLines: true,  // subtract printed ruled lines
+  removeBlobs: true,  // ignore large solid dark areas (binder holes, shadows, fills)
   minComponentArea: 0, // drop specks smaller than this (0 = auto)
   spurFactor: 1.5,    // prune skeleton branches shorter than this x stroke width
   joinAngleDeg: 40,   // continue straight through a junction if the bend is under this
@@ -18,7 +18,15 @@ export function extractStrokes(img, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const { width: w, height: h } = img;
   const gray = toGray(img);
-  const ink = binarize(gray, w, h, o);
+  const dark = darkness(gray, w, h);
+  const blobs = o.removeBlobs ? maskBlobs(dark, w, h, typicalStrokeHalf(hysteresis(dark, w, h, o.sensitivity), w, h)) : null;
+  let lineBands = [];
+  if (o.removeLines) {
+    lineBands = removeRuledLines(dark, w, h);
+    if (o.stats) o.stats.ruledLines = lineBands.length;
+  }
+  if (o.darkOut) o.darkOut(dark);
+  const ink = hysteresis(dark, w, h, o.sensitivity);
   removeSpecks(ink, w, h, o.minComponentArea || Math.max(8, Math.round((w * h) / 2e5)));
   const dist = distanceTransform(ink, w, h);
   const skel = thin(ink, w, h);
@@ -34,8 +42,15 @@ export function extractStrokes(img, opts = {}) {
     pts = clampWidths(pts);
     pts = smooth(pts, 2);
     pts = simplify(pts, o.simplifyEps);
+    if (length(pts) < Math.max(3, 2 * typicalHalf)) continue; // speck
+    if (onRuledLine(pts, lineBands, typicalHalf)) continue;  // leftover piece of a printed line
+    if (blobs && length(pts) < 8 * typicalHalf) {            // crumb at the rim of a hole
+      const lim = (blobs.reach + 6 * typicalHalf) ** 2;
+      if (pts.some(([x, y]) => blobs.toCore[Math.min(h - 1, y | 0) * w + Math.min(w - 1, x | 0)] <= lim)) continue;
+    }
     strokes.push({ points: pts });
   }
+  if (o.stats) o.stats.typicalHalfWidth = +typicalHalf.toFixed(2);
   return strokes;
 }
 
@@ -49,34 +64,198 @@ export function toGray({ data, width, height }) {
   return g;
 }
 
-// Sauvola adaptive threshold: copes with uneven lighting and paper shadows in photos.
-function binarize(gray, w, h, o) {
-  const win = o.window || Math.max(15, Math.round(Math.min(w, h) / 20) | 1);
-  const r = win >> 1;
-  const S = new Float64Array((w + 1) * (h + 1));
-  const S2 = new Float64Array((w + 1) * (h + 1));
-  for (let y = 0; y < h; y++) {
-    let row = 0, row2 = 0;
-    for (let x = 0; x < w; x++) {
-      const v = gray[y * w + x];
-      row += v; row2 += v * v;
-      const k = (y + 1) * (w + 1) + x + 1;
-      S[k] = S[k - w - 1] + row;
-      S2[k] = S2[k - w - 1] + row2;
+// How much darker each pixel is than the paper around it (0 = paper, 1 = black).
+// Paper brightness is the 90th percentile of each block, smoothed and interpolated,
+// which evens out shadows and lighting gradients across the page.
+export function darkness(gray, w, h) {
+  const B = Math.max(16, Math.round(Math.min(w, h) / 30));
+  const bw = Math.ceil(w / B), bh = Math.ceil(h / B);
+  let grid = new Float32Array(bw * bh);
+  const buf = [];
+  for (let by = 0; by < bh; by++) {
+    for (let bx = 0; bx < bw; bx++) {
+      buf.length = 0;
+      for (let y = by * B; y < Math.min(h, (by + 1) * B); y++)
+        for (let x = bx * B; x < Math.min(w, (bx + 1) * B); x++) buf.push(gray[y * w + x]);
+      buf.sort((a, b) => a - b);
+      grid[by * bw + bx] = buf[Math.floor(buf.length * 0.9)];
     }
   }
-  const ink = new Uint8Array(w * h);
+  // 3x3 max (blocks covered by ink borrow paper from neighbours), then 3x3 mean
+  const pass = (src, fn) => {
+    const out = new Float32Array(src.length);
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      const vals = [];
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const X = x + dx, Y = y + dy;
+        if (X >= 0 && Y >= 0 && X < bw && Y < bh) vals.push(src[Y * bw + X]);
+      }
+      out[y * bw + x] = fn(vals);
+    }
+    return out;
+  };
+  grid = pass(grid, (v) => Math.max(...v));
+  grid = pass(grid, (v) => v.reduce((a, b) => a + b, 0) / v.length);
+  const d = new Float32Array(w * h);
   for (let y = 0; y < h; y++) {
-    const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    const gy = Math.min(bh - 1, Math.max(0, (y + 0.5) / B - 0.5));
+    const y0 = Math.floor(gy), y1 = Math.min(bh - 1, y0 + 1), fy = gy - y0;
     for (let x = 0; x < w; x++) {
-      const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
-      const n = (x1 - x0) * (y1 - y0);
-      const a = y1 * (w + 1) + x1, b = y0 * (w + 1) + x1, c = y1 * (w + 1) + x0, d = y0 * (w + 1) + x0;
-      const mean = (S[a] - S[b] - S[c] + S[d]) / n;
-      const sd = Math.sqrt(Math.max(0, (S2[a] - S2[b] - S2[c] + S2[d]) / n - mean * mean));
-      const t = mean * (1 + o.sauvolaK * (sd / 0.5 - 1));
-      const v = gray[y * w + x];
-      ink[y * w + x] = v < t && v < mean - o.minInkContrast ? 1 : 0;
+      const gx = Math.min(bw - 1, Math.max(0, (x + 0.5) / B - 0.5));
+      const x0 = Math.floor(gx), x1 = Math.min(bw - 1, x0 + 1), fx = gx - x0;
+      const bg = (grid[y0 * bw + x0] * (1 - fx) + grid[y0 * bw + x1] * fx) * (1 - fy) +
+        (grid[y1 * bw + x0] * (1 - fx) + grid[y1 * bw + x1] * fx) * fy;
+      d[y * w + x] = Math.min(1, Math.max(0, 1 - gray[y * w + x] / Math.max(bg, 0.05)));
+    }
+  }
+  // the outermost sliver is usually the paper's edge or what is beyond it
+  const m = Math.max(2, Math.round(Math.min(w, h) * 0.006));
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++)
+    if (x < m || y < m || x >= w - m || y >= h - m) d[y * w + x] = 0;
+  return d;
+}
+
+// Printed ruled lines show up as rows that are slightly darker across the whole page.
+// For those rows, subtract the line's own darkness (a horizontal opening, which ignores
+// pen strokes crossing it), capped near the line's typical level so that ink drawn right
+// on top of a line survives. Returns the row bands of the lines removed.
+function removeRuledLines(d, w, h) {
+  const x0 = Math.floor(w * 0.08), x1 = Math.ceil(w * 0.92);
+  const prof = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    let s = 0;
+    for (let x = x0; x < x1; x++) s += Math.min(d[y * w + x], 0.15);
+    prof[y] = s / (x1 - x0);
+  }
+  const R = Math.max(6, Math.round(h / 150));
+  const peak = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    const win = Array.from(prof.subarray(Math.max(0, y - R), Math.min(h, y + R + 1))).sort((a, b) => a - b);
+    peak[y] = prof[y] - win[win.length >> 1];
+  }
+  const mad = median(Array.from(peak, Math.abs));
+  const thr = Math.max(0.004, 6 * mad);
+  const bands = [];
+  for (let y = 0; y < h; y++) {
+    if (peak[y] <= thr) continue;
+    const last = bands[bands.length - 1];
+    if (last && y - last[1] <= 2) last[1] = y; else bands.push([y, y]);
+  }
+  const L = Math.max(15, Math.round(w / 40)) | 1, r = L >> 1;
+  const tmp = new Float32Array(w), op = new Float32Array(w), ref = new Float32Array(w);
+  const bandOpen = (ya, yb, out) => { // per column max over rows ya..yb, then opened along x
+    for (let x = 0; x < w; x++) {
+      let m = 0;
+      for (let y = Math.max(0, ya); y <= Math.min(h - 1, yb); y++) m = Math.max(m, d[y * w + x]);
+      op[x] = m;
+    }
+    openRow(op, out, r);
+  };
+  const removed = [];
+  for (const [b0, b1] of bands) {
+    if (b1 - b0 > Math.max(8, h / 200)) continue; // too thick to be a printed line
+    // a printed line runs across most of the page; a long pen stroke does not.
+    // Opening (min then max along x) of the band's darkness removes grain spikes first.
+    let pk = b0;
+    for (let y = b0; y <= b1; y++) if (peak[y] > peak[pk]) pk = y;
+    // compare against an equally thick strip of paper just above (or below) the band
+    const t = b1 - b0 + 2;
+    const refA = b0 - 3 - t >= 0 ? b0 - 3 - t : b1 + 3;
+    bandOpen(b0 - 1, b1 + 1, tmp);
+    bandOpen(refA, refA + t, ref);
+    let covered = 0;
+    for (let x = x0; x < x1; x++) if (tmp[x] - ref[x] >= 0.5 * peak[pk] && tmp[x] <= 0.3) covered++;
+    if (covered < 0.55 * (x1 - x0)) continue;
+    removed.push([b0, b1]);
+    for (let y = Math.max(0, b0 - 1); y <= Math.min(h - 1, b1 + 1); y++) {
+      const row = d.subarray(y * w, y * w + w);
+      openRow(row, op, r, tmp);
+      const cap = median(Array.from(op.subarray(x0, x1))) * 2.5 + 0.015;
+      for (let x = 0; x < w; x++) row[x] = Math.max(0, row[x] - Math.min(op[x], cap));
+    }
+  }
+  return removed;
+}
+
+// Typical stroke half-width in px: the median distance-transform value on stroke ridges
+// (one ridge pixel per pixel of stroke length, so big blobs barely count).
+function typicalStrokeHalf(ink, w, h) {
+  const dist = distanceTransform(ink, w, h);
+  const ridge = [];
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const p = y * w + x, v = dist[p];
+    if (!v) continue;
+    let top = true;
+    forNeighbors(p, w, h, (q) => { if (dist[q] > v) top = false; });
+    if (top) ridge.push(Math.sqrt(v));
+  }
+  return median(ridge) || 1;
+}
+
+// Morphological opening along a row: out[x] = max over window of (min over window).
+// Keeps features at least 2r+1 long (printed lines), drops shorter ones (pen crossings).
+function openRow(src, out, r, scratch = new Float32Array(src.length)) {
+  const n = src.length;
+  for (let x = 0; x < n; x++) {
+    let m = Infinity;
+    for (let k = Math.max(0, x - r); k <= Math.min(n - 1, x + r); k++) if (src[k] < m) m = src[k];
+    scratch[x] = m;
+  }
+  for (let x = 0; x < n; x++) {
+    let m = -Infinity;
+    for (let k = Math.max(0, x - r); k <= Math.min(n - 1, x + r); k++) if (scratch[k] > m) m = scratch[k];
+    out[x] = m;
+  }
+}
+
+// Zero out big solid dark regions: binder holes, the table showing through, deep shadows.
+// Anything several times thicker than this photo's typical stroke is not writing.
+function maskBlobs(d, w, h, half) {
+  const r = Math.max(4, Math.round(3.5 * half));
+  const m = new Uint8Array(w * h);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    let s = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) s += d[(y + dy) * w + x + dx];
+    m[y * w + x] = s / 9 > 0.22 ? 1 : 0;
+  }
+  const dist = distanceTransform(m, w, h);
+  const notCore = new Uint8Array(w * h);
+  let any = false;
+  for (let i = 0; i < m.length; i++) { const core = dist[i] > r * r; notCore[i] = core ? 0 : 1; any ||= core; }
+  if (!any) return null;
+  const toCore = distanceTransform(notCore, w, h); // squared distance to the nearest core
+  const grow = (r + 8) * (r + 8);
+  for (let i = 0; i < d.length; i++) if (toCore[i] <= grow) d[i] = 0;
+  return { toCore, reach: r + 8 };
+}
+
+// Two-level threshold: strong ink starts a stroke, fainter ink connected to it extends it.
+// Faint pencil survives as long as part of it is clearly visible; isolated grain does not.
+function hysteresis(raw, w, h, sensitivity) {
+  // 3x3 box blur: grain averages out, real strokes (2+ px wide) keep most of their darkness
+  const d = new Float32Array(w * h);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    let t = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) t += raw[(y + dy) * w + x + dx];
+    d[y * w + x] = t / 9;
+  }
+  // noise floor of this photo: median and spread of the (mostly paper) darkness values
+  const sample = [];
+  for (let i = 0; i < d.length; i += 7) sample.push(d[i]);
+  sample.sort((a, b) => a - b);
+  const med = sample[sample.length >> 1];
+  const mad = median(sample.map((v) => Math.abs(v - med))) * 1.4826;
+  const s = Math.min(1, Math.max(0, sensitivity));
+  const lo = Math.max(0.07 - 0.05 * s, med + (6 - 3 * s) * mad); // base 0.07 .. 0.02
+  const hi = Math.max(lo * 2, med + (10 - 4 * s) * mad);
+  const ink = new Uint8Array(w * h);
+  const stack = [];
+  for (let i = 0; i < d.length; i++) {
+    if (d[i] <= hi || ink[i]) continue;
+    ink[i] = 1; stack.push(i);
+    while (stack.length) {
+      const p = stack.pop();
+      forNeighbors(p, w, h, (q) => { if (!ink[q] && d[q] > lo) { ink[q] = 1; stack.push(q); } });
     }
   }
   return ink;
@@ -381,6 +560,23 @@ function joinAtJunctions(graph, w, maxBendDeg) {
 }
 
 // ------------------------------------------------------------------ polylines
+
+function length(pts) {
+  let L = 0;
+  for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+  return L;
+}
+
+// A flat, nearly horizontal stroke sitting inside a ruled-line band is what is left of the
+// printed line, not writing.
+function onRuledLine(pts, bands, half) {
+  if (!bands.length) return false;
+  let y0 = Infinity, y1 = -Infinity;
+  for (const p of pts) { y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); }
+  if (y1 - y0 > Math.max(4, 2.5 * half)) return false;
+  const m = Math.max(3, 1.5 * half);
+  return bands.some(([b0, b1]) => y0 >= b0 - m && y1 <= b1 + m);
+}
 
 function median(a) {
   if (!a.length) return 0;

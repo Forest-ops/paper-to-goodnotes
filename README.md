@@ -13,7 +13,7 @@ file with real, editable ink strokes.
 | `src/layout.js` | Photo pixels → Goodnotes page points |
 | `tools/` | Python tools for reverse-engineering and checking files (`gndump`, `gnstrokes`, `gnwrite`, `maketemplate`) |
 | `docs/goodnotes-format.md` | What is known about the file format |
-| `test/` | `extract-test.mjs` (accuracy against known strokes), `build-test.mjs` (end to end) |
+| `test/` | `extract-test.mjs` (accuracy against known strokes), `photo-test.mjs` / `photo-build.mjs` (real photos in `samples/real/`, not committed), `build-test.mjs` (end to end) |
 
 ## Run locally
 

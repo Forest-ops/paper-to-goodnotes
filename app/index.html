@@ -71,7 +71,7 @@
       <label class="btn" for="library">Choose photo</label>
       <input id="library" type="file" accept="image/*">
     </div>
-    <p class="hint" style="margin:12px 0 0">Shoot straight down, fill the frame with the page, and avoid strong shadows.</p>
+    <p class="hint" style="margin:12px 0 0">Shoot from above with the whole page in view, on a darker surface if you can. Avoid strong shadows.</p>
   </section>
 
   <section class="panel">
@@ -84,8 +84,8 @@
     <div class="controls">
       <div>
         <label for="sens">Ink sensitivity</label>
-        <input id="sens" type="range" min="0.05" max="0.45" step="0.01" value="0.2">
-        <div class="hint">Lower picks up fainter ink; higher ignores smudges and lines.</div>
+        <input id="sens" type="range" min="0" max="1" step="0.05" value="0.5">
+        <div class="hint">Higher picks up fainter pencil; lower ignores smudges and printed text.</div>
       </div>
       <div>
         <label>Pen width</label>
@@ -98,6 +98,8 @@
         <div class="hint">"Photo" copies the thickness of your pen on paper.</div>
       </div>
       <div>
+        <label class="toggle"><input id="findPage" type="checkbox" checked> Find and straighten the page</label>
+        <div class="hint" style="margin-bottom:12px">Turn off if the photo is already just the page.</div>
         <label class="toggle"><input id="showPhoto" type="checkbox" checked> Show photo behind strokes</label>
       </div>
     </div>

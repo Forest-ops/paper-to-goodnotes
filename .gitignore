@@ -4,3 +4,4 @@ samples/testing/
 samples/template.goodnotes
 __pycache__/
 *.pyc
+samples/real/
